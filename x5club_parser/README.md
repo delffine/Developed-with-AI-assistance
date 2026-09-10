@@ -26,3 +26,5 @@
 - orders.csv        : Сырые данные из личного кабинета.
 - orders_sorted.csv : Очищенные и категоризированные данные для BI.
 - DL_Пятерочка.МоиТраты.json: Воркбук DataLens
+
+![img](/x5club_parser/dl_all.png)
