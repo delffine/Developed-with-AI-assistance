@@ -1,43 +1,11 @@
-################################################################################################
-#   Retail Purchase Analytics Pipeline
-#=============================================
-#
-#Данный скрипт представляет собой инструмент для автоматического сбора,
-#очистки и категоризации истории заказов из личного кабинета x5Club.
-#
-#ОСНОВНОЙ ФУНКЦИОНАЛ:
-#1. Авторизации в ЛК вручную - парсер откроет ЛК и введет телефон, а вот код из SMS надо будет ввести вам.
-#2. Сохранение сессии в state.json для обхода повторного ввода SMS.
-#3. Парсинг данных: Сбор истории заказов с использованием Playwright (включая работу с календарем).
-#4. ETL-процесс (Extract, Transform, Load):
-#   - Удаление дубликатов на основе уникальных ключей заказа.
-#   - Нормализация названий товаров (приведение вариаций к единой сущности).
-#   - Категоризация товаров по заданным словарям (Уровень 1: Сущность -> Уровень 2: Категория).
-#   - Сортировка данных по времени и позиции в чеке.
-#5. Подготовка данных: Экспорт в CSV для последующей визуализации в BI-системах (например, DataLens).
-#
-#РЕЖИМЫ РАБОТЫ (CLI):
-#- python script.py login                    -> Авторизация и сохранение сессии.
-#- python script.py parse [start] [end]       -> Сбор данных за период (гггг-мм-дд).
-#- python script.py process                  -> Обработка, очистка и категоризация данных.
-#
-#ФАЙЛЫ:
-#- config.json       : Настройки доступа (URL, телефон).
-#- state.json        : Данные сессии браузера.
-#- orders.csv        : Сырые данные из личного кабинета.
-#- orders_sorted.csv : Очищенные и категоризированные данные для BI.
-#
-#===========================================
-#   Developed with AI assistance
-#   Навайбокодено delffine с помощью gemma4:31b
-################################################################################################
-
 import asyncio
 import json
 import os
 import sys
 import csv
 import re
+import hashlib
+import httpx
 from datetime import datetime, timedelta
 from playwright.async_api import async_playwright
 
@@ -45,227 +13,8 @@ from playwright.async_api import async_playwright
 STATE_FILE = "state.json"
 CSV_FILE = "orders.csv"
 SORTED_CSV_FILE = "orders_sorted.csv"
-
-# --- ТАБЛИЦЫ КАТЕГОРИЗАЦИИ ---
-
-# Уровень 1: Приведение разных названий к одному "сущностному" названию
-# Мы используем поиск по ключевому слову. Если слово найдено в названии -> присваиваем единое имя.
-PRODUCT_MAPPING = {
-    # Овощи и фрукты
-    "бананы": "Бананы",
-    "яблоко": "Яблоки",
-    "яблоки": "Яблоки",    
-    "апельсин": "Апельсины",
-    "мандарин": "Мандарины",
-    "лимон": "Лимоны",
-    "виноград": "Виноград",
-    "дыня": "Дыня",
-    "персик": "Персики",
-    "нектарин": "Нектарины",
-    "манго": "Манго",
-    "лук": "Лук",
-    "чеснок": "Чеснок",
-    "картофель": "Картофель",
-    "капуста": "Капуста",
-    "перец": "Перец",
-    "огурец": "Огурцы",
-    "морковь": "Морковь",
-    "шампиньоны": "Грибы",
-    "курага": "Сухофрукты",
-    "изюм": "Сухофрукты",
-    "чернослив": "Сухофрукты",
-    "смесь": "Смесь овощная",
-    "горошек": "Горошек",
-    "кукуруза": "Кукуруза",
-    "огурцы": "Огурцы",
-    "абрикос": "Абрикосы",
-    "имбирь": "Имбирь",
-    "клубник": "Клубника",
-    
-    #Орехи
-    "фундук": "Орехи",   
-    "орех": "Орехи",  
-    "арахис": "Орехи",    
-
-    # Мясо и Птица
-    "индейка": "Курица/Индейка",
-    "индейк": "Курица/Индейка", 
-    "индеек": "Курица/Индейка",    
-    "цыпленка": "Курица/Индейка",
-    "цыплёнк": "Курица/Индейка",
-    "цыплят": "Курица/Индейка",    
-    "куриное": "Курица/Индейка",
-    "филе грудки": "Курица/Индейка",
-    
-    "свинина": "Мясные изделия",
-    "гуляш": "Мясные изделия",
-    "азу": "Мясные изделия",
-    "купаты": "Мясные изделия",
-    "колбаса": "Мясные изделия",
-    "сервелат": "Мясные изделия",
-    "ветчина": "Мясные изделия",
-    "сосиски": "Мясные изделия",
-    "сардельки": "Мясные изделия",
-    "салями": "Мясные изделия",
-    "окорок": "Мясные изделия",
-    "слайсы": "Мясные изделия",
-    "пельмени": "Пельмени",
-    
-    # Рыба и Морепродукты
-    "креветки": "Морепродукты",
-    "крабовые": "Морепродукты",
-    "килька": "Рыба консервированная",
-    "горбуша": "Рыба",
-    "скумбрия": "Рыба",
-    "сельдь": "Рыба",
-    "рыбное": "Рыба",
-    "сардина": "Рыба консервированная",
-    "сайра": "Рыба консервированная",
-    "тунец": "Рыба консервированная",
-    "рыбное ассорти": "Рыба",
-    "краб": "Крабовое мясо",
-
-    # Молочка и Яйца
-    "йогурт": "Йогурты",
-    "творог": "Творог",
-    "творожок": "Творог",
-    "сыр": "Сыр",
-    "сметана": "Сметана",
-    "сливки": "Сливки",
-    "масло сливочное": "Сливочное масло",
-    "спред": "Сливочное масло",    
-    "яйцо": "Яйца",
-    "яйца": "Яйца",    
-    "молоко": "Молоко",
-
-    # Бакалея и специи
-    "макароны": "Макаронные изделия",
-    "спагетти": "Макаронные изделия",
-    "рожки": "Макаронные изделия",
-    "рис": "Крупы",
-    "гречка": "Крупы",
-    "перловка": "Крупы",
-    "сахар": "Сахар",
-    "соль": "Соль",
-    "масло подсолнечное": "Растительное масло",
-    "подсолнечное": "Растительное масло",
-    "уксус": "Уксус",
-    "кетчуп": "Соусы",
-    "соус": "Соусы",
-    "приправа": "Специи",
-    "лавровый": "Специи",
-    "паприка": "Специи",
-    "лимонная кислота": "Специи",
-
-    # Сладости и Выпечка
-    "конфеты": "Конфеты",
-    "зефир": "Зефир",
-    "вафли": "Вафли",
-    "шоколад": "Шоколад",
-    "печенье": "Печенье",
-    "пастила": "Пастила",
-    "торт": "Торты",
-    "рулет": "Торты",
-    "десерт": "Сладости",
-    "хлеб": "Хлеб",
-    "батон": "Хлеб",
-    "лаваш": "Хлеб",
-    "пломбир": "Мороженое",    
-    "морожен": "Мороженое",    
-    "джем": "Джем",
-    "топпинг": "Джем", 
-
-    # Напитки
-    "кофе": "Кофе",
-    "чай": "Чай",
-    "вода": "Вода",
-    "кола": "Газировка",
-    "напиток": "Газировка",
-    "коктейль": "Газировка",    
-    "вино": "Алкоголь",
-    "пиво": "Алкоголь",
-
-    # Хозтовары и Гигиена
-    "крем для лица": "Косметика",
-    "крем для рук": "Косметика",
-    "крем": "Косметика",     
-    "зубная паста": "Гигиена",
-    "шампунь": "Гигиена",
-    "салфет": "Гигиена",
-    "cалфет": "Гигиена",    
-    "бумага": "Гигиена",
-    "доместос": "Бытовая химия",
-    "средство для мытья": "Бытовая химия",
-    "средство для стирки": "Бытовая химия",
-    "чистящее": "Бытовая химия",
-    "стирки": "Бытовая химия",
-    "порошок": "Бытовая химия",    
-    "пакет": "Пакет",
-    "клей": "Хозтовары",
-    "губки": "Хозтовары",
-    "посуд": "Хозтовары",    
-
-    # Прочее
-    "корм": "Разное",
-    "игрушка": "Разное",
-    "смешарик": "Разное",
-    "журнал": "Журналы",    
-
-}
-
-# Уровень 2: Привязка единого названия к категории
-CATEGORY_MAPPING = {
-    # Овощи и фрукты
-    "Бананы": "Овощи и фрукты", "Яблоки": "Овощи и фрукты", "Апельсины": "Овощи и фрукты",
-    "Мандарины": "Овощи и фрукты", "Лимоны": "Овощи и фрукты", "Виноград": "Овощи и фрукты",
-    "Дыня": "Овощи и фрукты", "Персики": "Овощи и фрукты", "Нектарины": "Овощи и фрукты",
-    "Манго": "Овощи и фрукты", "Лук": "Овощи и фрукты", "Чеснок": "Овощи и фрукты",
-    "Картофель": "Овощи и фрукты", "Капуста": "Овощи и фрукты", "Перец": "Овощи и фрукты",
-    "Огурцы": "Овощи и фрукты", "Морковь": "Овощи и фрукты", "Грибы": "Овощи и фрукты",
-    "Сухофрукты": "Овощи и фрукты", "Смесь овощная" : "Овощи и фрукты", "Горошек": "Овощи и фрукты",
-    "Кукуруза": "Овощи и фрукты", "Огурцы": "Овощи и фрукты", "Абрикосы": "Овощи и фрукты",
-    "Клубника": "Овощи и фрукты",
-    
-    #Орехи
-    "Орехи": "Орехи", "Имбирь": "Имбирь",
-    
-    # Мясо и колбасы
-    "Индейка": "Мясо и колбасы", "Курица": "Мясо и колбасы", "Свинина": "Мясо и колбасы",
-    "Мясные изделия": "Мясо и колбасы", "Курица/Индейка": "Мясо и колбасы",
-    "Пельмени": "Мясо и колбасы",
-
-    # Рыба
-    "Морепродукты": "Рыба и морепродукты", "Рыба": "Рыба и морепродукты",
-    "Рыба консервированная": "Рыба и морепродукты", "Крабовое мясо": "Рыба и морепродукты",
-
-    # Молочка
-    "Йогурты": "Молочные продукты", "Творог": "Молочные продукты", "Сыр": "Молочные продукты",
-    "Сметана": "Молочные продукты", "Сливки": "Молочные продукты", "Сливочное масло": "Молочные продукты",
-    "Яйца": "Молочные продукты", "Мороженое": "Молочные продукты", "Молоко": "Молочные продукты",
-
-    # Бакалея
-    "Макаронные изделия": "Бакалея", "Крупы": "Бакалея", "Сахар": "Бакалея",
-    "Соль": "Бакалея", "Растительное масло": "Бакалея", "Уксус": "Бакалея",
-    "Соусы": "Бакалея", "Специи": "Бакалея",  
-
-    # Сладости и Хлеб
-    "Конфеты": "Сладости", "Зефир": "Сладости", "Вафли": "Сладости",
-    "Шоколад": "Сладости", "Печенье": "Сладости", "Пастила": "Сладости",
-    "Торты": "Сладости", "Сладости": "Сладости", "Хлеб": "Сладости", "Джем": "Сладости",
-
-
-    # Напитки
-    "Кофе": "Напитки", "Чай": "Напитки", "Вода": "Напитки",
-    "Газировка": "Напитки", "Алкоголь": "Напитки",
-
-    # Химия и гигиена
-    "Косметика": "Бытовая химия и гигиена", "Гигиена": "Бытовая химия и гигиена",
-    "Бытовая химия": "Бытовая химия и гигиена", "Хозтовары": "Бытовая химия и гигиена",
-    "Пакет": "Пакет",
-
-    # Прочее
-    "Зоотовары": "Прочее", "Разное": "Прочее", "Cалфетки": "Прочее", "Журналы": "Прочее",
-}
+MAPPING_FILE = "mapping.json"
+IMG_FOLDER = "img"
 
 RUSSIAN_MONTHS_FULL = {
     1: "Января", 2: "Февраля", 3: "Марта", 4: "Апреля",
@@ -278,9 +27,18 @@ RUSSIAN_MONTHS_SHORT = {
     "СЕН": 9, "ОКТ": 10, "НОЯ": 11, "ДЕК": 12
 }
 
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+
 def load_config():
     config_path = os.path.join(os.path.dirname(__file__), 'config.json')
     with open(config_path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+def load_mapping():
+    if not os.path.exists(MAPPING_FILE):
+        print(f"Предупреждение: Файл {MAPPING_FILE} не найден.")
+        return {}
+    with open(MAPPING_FILE, 'r', encoding='utf-8') as f:
         return json.load(f)
 
 def parse_russian_date(date_str):
@@ -335,73 +93,97 @@ def clean_price(price_str):
 def format_date_for_label(dt):
     return f"{dt.day} {RUSSIAN_MONTHS_FULL[dt.month]} {dt.year}"
 
-# --- ЛОГИКА ОБРАБОТКИ ДАННЫХ (НОВАЯ ВЕТКА) ---
+async def download_product_image(url, product_name):
+    if not url or url == "Не найдено":
+        return "Не найдено"
+    try:
+        hash_name = hashlib.md5(product_name.encode('utf-8')).hexdigest()
+        ext = ".jpg"
+        if ".png" in url.lower(): ext = ".png"
+        elif ".jpeg" in url.lower(): ext = ".jpeg"
+
+        filename = f"{hash_name}{ext}"
+        filepath = os.path.join(IMG_FOLDER, filename)
+
+        if os.path.exists(filepath):
+            return filename
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, timeout=10.0)
+            if response.status_code == 200:
+                with open(filepath, "wb") as f:
+                    f.write(response.content)
+                return filename
+    except Exception as e:
+        print(f"Ошибка при загрузке фото для {product_name}: {e}")
+    return "Ошибка"
+
+# --- ЛОГИКА ОБРАБОТКИ ДАННЫХ ---
+
 def process_data():
     print("Запуск обработки данных...")
-    if not os.path.exists(CSV_FILE):
-        print("Файл orders.csv не найден. Нечего обрабатывать.")
+    new_data = []
+    if os.path.exists(CSV_FILE):
+        with open(CSV_FILE, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f, delimiter=';')
+            new_data = list(reader)
+
+    existing_data = []
+    if os.path.exists(SORTED_CSV_FILE):
+        with open(SORTED_CSV_FILE, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f, delimiter=';')
+            existing_data = list(reader)
+
+    if not new_data and not existing_data:
+        print("Нет данных для обработки.")
         return
 
-    with open(CSV_FILE, 'r', encoding='utf-8-sig') as f:
-        reader = csv.DictReader(f, delimiter=';')
-        data = list(reader)
+    combined_data = existing_data + new_data
 
-    if not data:
-        print("Файл пуст.")
-        return
+    # Удаление дубликатов
+    unique_map = {}
+    for row in combined_data:
+        key = (row.get('date'), row.get('address'), row.get('item_no'), row.get('product_name'))
+        unique_map[key] = row
 
-    # 1. Удаление дубликатов
-    # Уникальный ключ: дата + адрес + номер товара в чеке + название
-    unique_data = {}
-    for row in data:
-        key = (row['date'], row['address'], row['item_no'], row['product_name'])
-        unique_data[key] = row
+    processed_list = list(unique_map.values())
+    processed_list.sort(key=lambda x: (x.get('date', ''), int(x.get('item_no', 0)) if x.get('item_no', '').isdigit() else 0))
 
-    processed_list = list(unique_data.values())
-    print(f"Дубликаты удалены. Осталось строк: {len(processed_list)}")
-
-    # 2. Сортировка по дате и номеру товара
-    # Сортируем сначала по дате (строка ISO), затем по item_no (число)
-    processed_list.sort(key=lambda x: (x['date'], int(x['item_no']) if x['item_no'].isdigit() else 0))
-
-    # 3. Категоризация
+    mapping = load_mapping()
     final_data = []
     for row in processed_list:
-        original_name = row['product_name'].lower()
+        # Гарантируем наличие поля image, если его нет в старых данных
+        if 'image' not in row:
+            row['image'] = 'Не найдено'
 
-        # Уровень 1: Нормализация (Поиск по ключевым словам)
-        normalized_name = row['product_name'] # По умолчанию оригинал
-        for keyword, unified_name in PRODUCT_MAPPING.items():
-            if keyword.lower() in original_name:
-                normalized_name = unified_name
-                break
-
-        # Уровень 2: Категория
+        original_name = row.get('product_name', '').lower()
+        normalized_name = row.get('product_name', 'Не определено')
         category = "Прочее"
-        if normalized_name in CATEGORY_MAPPING:
-            category = CATEGORY_MAPPING[normalized_name]
-
-        # Добавляем новые поля в строку
+        for keyword, values in mapping.items():
+            if keyword.lower() in original_name:
+                normalized_name = values[0]
+                category = values[1]
+                break
         row['normalized_name'] = normalized_name
         row['category'] = category
         final_data.append(row)
 
-    # 4. Сохранение в новый файл (перезапись)
     if final_data:
+        # Берем ключи из первой строки, чтобы заголовок был правильным
         keys = final_data[0].keys()
         with open(SORTED_CSV_FILE, 'w', encoding='utf-8-sig', newline='') as f:
             dict_writer = csv.DictWriter(f, fieldnames=keys, delimiter=';')
             dict_writer.writeheader()
             dict_writer.writerows(final_data)
-        print(f"Обработанные данные сохранены в {SORTED_CSV_FILE}")
+        print(f"Итоговые данные сохранены в {SORTED_CSV_FILE}")
 
-# --- ЛОГИКА КАЛЕНДАРЯ ---
+# --- ЛОГИКА ПАРСИНГА ---
+
 async def select_date_range(page, start_date_str, end_date_str):
     print(f"Установка периода: {start_date_str} -> {end_date_str}")
     calendar_trigger = page.locator('div[aria-label*="Выбрать период"]')
     await calendar_trigger.click()
     await asyncio.sleep(0.5)
-
     start_dt = datetime.strptime(start_date_str, '%Y-%m-%d')
     end_dt = datetime.strptime(end_date_str, '%Y-%m-%d')
 
@@ -419,8 +201,7 @@ async def select_date_range(page, start_date_str, end_date_str):
             current_month_name = current_label.split()[1]
             month_to_num = {v: k for k, v in RUSSIAN_MONTHS_FULL.items()}
             current_month_num = month_to_num.get(current_month_name, 1)
-            if (target_dt.year > current_year) or \
-               (target_dt.year == current_year and target_dt.month > current_month_num):
+            if (target_dt.year > current_year) or (target_dt.year == current_year and target_dt.month > current_month_num):
                 await page.get_by_label("Следующий месяц").click()
             else:
                 await page.get_by_label("Предыдущий месяц").click()
@@ -441,7 +222,6 @@ async def select_date_range(page, start_date_str, end_date_str):
         print(f"Не удалось нажать 'Выбрать': {e}")
     await asyncio.sleep(1)
 
-# --- ОСНОВНОЙ ПАРСИНГ ---
 async def check_auth(page):
     await asyncio.sleep(2)
     keywords = ["Главная", "История", "Партнёры"]
@@ -451,6 +231,8 @@ async def check_auth(page):
     return False
 
 async def parse_flow(page, start_date, end_date):
+    os.makedirs(IMG_FOLDER, exist_ok=True)
+
     try:
         await select_date_range(page, start_date, end_date)
     except Exception as e:
@@ -494,6 +276,12 @@ async def parse_flow(page, start_date, end_date):
             rows = await page.locator(".flex.flex-row.gap-3.py-1").all()
             for idx, row in enumerate(rows, start=1):
                 full_text = await row.inner_text()
+
+                img_elem = row.locator('img')
+                img_url = "Не найдено"
+                if await img_elem.count() > 0:
+                    img_url = await img_elem.first.get_attribute('src')
+
                 try:
                     text_no_img_price = re.sub(r'^\d+[\.,]\d+\s+', '', full_text)
                     split_match = re.search(r'(\d+(?:[\.,]\d+)?)\s*(шт\.|кг\.)\s*x\s*', text_no_img_price)
@@ -503,12 +291,13 @@ async def parse_flow(page, start_date, end_date):
                         qty = split_match.group(1).strip()
                         prices_part = text_no_img_price[split_match.end():]
                         price_blocks = [p.strip() for p in prices_part.split('₽') if p.strip()]
-
                         p_unit_raw = price_blocks[0] if len(price_blocks) > 0 else "0"
                         p_total_raw = price_blocks[1] if len(price_blocks) > 1 else "0"
                         p_disc_raw = price_blocks[2] if len(price_blocks) > 2 else "0"
                     else:
                         product_name, qty, p_unit_raw, p_total_raw, p_disc_raw = "Не определено", "0", "0", "0", "0"
+
+                    img_filename = await download_product_image(img_url, product_name)
 
                     bonuses_match = re.search(r'\+\s*(\d+)', full_text)
                     bonuses = bonuses_match.group(1) if bonuses_match else "0"
@@ -518,6 +307,7 @@ async def parse_flow(page, start_date, end_date):
                         "date": formatted_date,
                         "address": address_val.strip(),
                         "product_name": product_name,
+                        "image": img_filename,
                         "quantity": qty,
                         "price_unit": clean_price(p_unit_raw),
                         "total_price": clean_price(p_total_raw),
@@ -545,18 +335,18 @@ async def parse_flow(page, start_date, end_date):
             if not file_exists:
                 dict_writer.writeheader()
             dict_writer.writerows(all_data)
-        print(f"Успешно сохранено {len(all_data)} позиций.")
+        print(f"Успешно сохранено {len(all_data)} позиций в {CSV_FILE}.")
 
 async def main():
     if len(sys.argv) < 2:
-        print("Использование: python scriptname.py login ИЛИ python scriptname.py parse [start_date] [end_date] ИЛИ python scriptname.py process")
+        print("Использование:\n python script.py login\n python script.py parse [start_date] [end_date]\n python script.py process")
         return
 
     mode = sys.argv[1]
 
     if mode == "process":
         process_data()
-        return # Завершаем выполнение, так как браузер не нужен
+        return
 
     if mode == "parse":
         if len(sys.argv) >= 3: start_date = sys.argv[2]
@@ -584,9 +374,10 @@ async def main():
                 print("Сессия сохранена.")
             except Exception as e:
                 print(f"Ошибка: {e}")
+
         elif mode == "parse":
             if not os.path.exists(STATE_FILE):
-                print("Нет файла сессии!"); await browser.close(); return
+                print("Нет файла сессии! Сначала запустите login."); await browser.close(); return
             context = await browser.new_context(storage_state=STATE_FILE)
             page = await context.new_page()
             await page.goto(config['url'])
@@ -594,6 +385,7 @@ async def main():
                 await parse_flow(page, start_date, end_date)
             else:
                 print("Сессия истекла. Запустите login.")
+
         await asyncio.sleep(2)
         await browser.close()
 
