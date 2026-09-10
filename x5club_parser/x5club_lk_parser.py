@@ -567,8 +567,8 @@ async def main():
     async with async_playwright() as p:
         # Если режим login — открываем браузер (чтобы ввести SMS),
         # если parse — запускаем в фоне (headless=True)
-        #is_headless = True if mode == "parse" else False
-        #browser = await p.chromium.launch(headless=is_headless)
+        is_headless = True if mode == "parse" else False
+        browser = await p.chromium.launch(headless=is_headless)
         if mode == "login":
             context = await browser.new_context()
             page = await context.new_page()
