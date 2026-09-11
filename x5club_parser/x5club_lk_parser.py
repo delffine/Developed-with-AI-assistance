@@ -15,6 +15,7 @@ CSV_FILE = "orders.csv"
 SORTED_CSV_FILE = "orders_sorted.csv"
 MAPPING_FILE = "mapping.json"
 IMG_FOLDER = "img"
+MAX_PERIOD_DAYS = 30  # Ограничение периода одним запуском
 
 RUSSIAN_MONTHS_FULL = {
     1: "Января", 2: "Февраля", 3: "Марта", 4: "Апреля",
@@ -36,7 +37,6 @@ def load_config():
 
 def load_mapping():
     if not os.path.exists(MAPPING_FILE):
-        print(f"Предупреждение: Файл {MAPPING_FILE} не найден.")
         return {}
     with open(MAPPING_FILE, 'r', encoding='utf-8') as f:
         return json.load(f)
@@ -93,9 +93,13 @@ def clean_price(price_str):
 def format_date_for_label(dt):
     return f"{dt.day} {RUSSIAN_MONTHS_FULL[dt.month]} {dt.year}"
 
-async def download_product_image(url, product_name):
+# --- НОВАЯ ЛОГИКА РАБОТЫ С КАРТИНКАМИ (АСИНХРОННАЯ) ---
+
+async def download_image_task(client, url, product_name):
+    """Одиночная задача на скачивание картинки"""
     if not url or url == "Не найдено":
         return "Не найдено"
+
     try:
         hash_name = hashlib.md5(product_name.encode('utf-8')).hexdigest()
         ext = ".jpg"
@@ -105,19 +109,96 @@ async def download_product_image(url, product_name):
         filename = f"{hash_name}{ext}"
         filepath = os.path.join(IMG_FOLDER, filename)
 
+        # Проверка: если файл уже существует, не качаем
         if os.path.exists(filepath):
             return filename
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, timeout=10.0)
-            if response.status_code == 200:
-                with open(filepath, "wb") as f:
-                    f.write(response.content)
-                return filename
+        response = await client.get(url, timeout=10.0)
+        if response.status_code == 200:
+            with open(filepath, "wb") as f:
+                f.write(response.content)
+            return filename
     except Exception as e:
-        print(f"Ошибка при загрузке фото для {product_name}: {e}")
+        print(f"Ошибка при загрузке фото {product_name}: {e}")
     return "Ошибка"
 
+async def process_images_batch(image_data):
+    """
+    Принимает список кортежей [(product_name, url), ...]
+    и скачивает их асинхронно пачками.
+    """
+    if not image_data:
+        return {}
+
+    results = {}
+    async with httpx.AsyncClient() as client:
+        tasks = []
+        # Создаем задачи для всех картинок
+        for name, url in image_data:
+            tasks.append(download_image_task(client, url, name))
+
+        # Запускаем всё параллельно
+        downloaded_filenames = await asyncio.gather(*tasks)
+
+        # Сопоставляем результат с названием товара
+        for i, (name, url) in enumerate(image_data):
+            results[f"{name}_{url}"] = downloaded_filenames[i]
+
+    return results
+
+# --- ЛОГИКА ОПРЕДЕЛЕНИЯ ПЕРИОДА ---
+
+def calculate_dates(arg_start=None, arg_end=None):
+    today = datetime.now()
+
+    # 1. Если даты заданы вручную — используем их (без ограничений)
+    if arg_start and arg_end:
+        start_date = datetime.strptime(arg_start, '%Y-%m-%d')
+        end_date = datetime.strptime(arg_end, '%Y-%m-%d')
+        return start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
+
+    # 2. Определяем точку отсчета
+    # Если данных нет, начинаем с даты "год назад"
+    if not os.path.exists(SORTED_CSV_FILE):
+        base_date = today - timedelta(days=365)
+    else:
+        try:
+            with open(SORTED_CSV_FILE, 'r', encoding='utf-8-sig') as f:
+                reader = csv.DictReader(f, delimiter=';')
+                data = list(reader)
+                if data:
+                    # Берем САМУЮ РАННЮЮ дату из файла, чтобы понять, откуда мы начали
+                    # или САМУЮ ПОЗДНЮЮ, чтобы идти вперед.
+                    # Для логики "докачки" берем самую позднюю дату + 1 день.
+                    dates = [r['date'].split(' ')[0] for r in data if r['date'] != "0000-00-00 00:00:00"]
+                    if dates:
+                        last_date_str = max(dates) # Самая свежая дата
+                        base_date = datetime.strptime(last_date_str, '%Y-%m-%d') + timedelta(days=1)
+                    else:
+                        base_date = today - timedelta(days=365)
+                else:
+                    base_date = today - timedelta(days=365)
+        except Exception as e:
+            print(f"Ошибка при чтении CSV: {e}")
+            base_date = today - timedelta(days=365)
+
+    # 3. Формируем окно в 30 дней
+    start_date = base_date
+    end_date = start_date + timedelta(days=MAX_PERIOD_DAYS)
+
+    # 4. Ограничиваем, чтобы не уйти в будущее
+    if end_date > today:
+        end_date = today
+
+    # Если start_date уже больше сегодня, значит всё выкачали
+    if start_date > today:
+        print("Все данные за период выкачаны.")
+        # Чтобы скрипт не падал, возвращаем сегодняшний день
+        return today.strftime('%Y-%m-%d'), today.strftime('%Y-%m-%d')
+
+    return start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
+    
+    
 # --- ЛОГИКА ОБРАБОТКИ ДАННЫХ ---
 
 def process_data():
@@ -140,7 +221,6 @@ def process_data():
 
     combined_data = existing_data + new_data
 
-    # Удаление дубликатов
     unique_map = {}
     for row in combined_data:
         key = (row.get('date'), row.get('address'), row.get('item_no'), row.get('product_name'))
@@ -152,10 +232,7 @@ def process_data():
     mapping = load_mapping()
     final_data = []
     for row in processed_list:
-        # Гарантируем наличие поля image, если его нет в старых данных
-        if 'image' not in row:
-            row['image'] = 'Не найдено'
-
+        if 'image' not in row: row['image'] = 'Не найдено'
         original_name = row.get('product_name', '').lower()
         normalized_name = row.get('product_name', 'Не определено')
         category = "Прочее"
@@ -169,7 +246,6 @@ def process_data():
         final_data.append(row)
 
     if final_data:
-        # Берем ключи из первой строки, чтобы заголовок был правильным
         keys = final_data[0].keys()
         with open(SORTED_CSV_FILE, 'w', encoding='utf-8-sig', newline='') as f:
             dict_writer = csv.DictWriter(f, fieldnames=keys, delimiter=';')
@@ -257,6 +333,8 @@ async def parse_flow(page, start_date, end_date):
     print(f"Итого найдено заказов: {count}")
 
     all_data = []
+    image_queue = [] # Список для сбора (name, url)
+
     for i in range(count):
         try:
             btn = order_buttons.nth(i)
@@ -297,7 +375,8 @@ async def parse_flow(page, start_date, end_date):
                     else:
                         product_name, qty, p_unit_raw, p_total_raw, p_disc_raw = "Не определено", "0", "0", "0", "0"
 
-                    img_filename = await download_product_image(img_url, product_name)
+                    # Добавляем в очередь на скачивание вместо немедленного скачивания
+                    image_queue.append((product_name, img_url))
 
                     bonuses_match = re.search(r'\+\s*(\d+)', full_text)
                     bonuses = bonuses_match.group(1) if bonuses_match else "0"
@@ -307,7 +386,7 @@ async def parse_flow(page, start_date, end_date):
                         "date": formatted_date,
                         "address": address_val.strip(),
                         "product_name": product_name,
-                        "image": img_filename,
+                        "image_url": img_url, # Временно храним URL
                         "quantity": qty,
                         "price_unit": clean_price(p_unit_raw),
                         "total_price": clean_price(p_total_raw),
@@ -327,6 +406,17 @@ async def parse_flow(page, start_date, end_date):
         except Exception as e:
             print(f"Ошибка заказа {i}: {e}")
 
+    # --- АСИНХРОННОЕ СКАЧИВАНИЕ КАРТИНКИ ---
+    if image_queue:
+        print(f"Загрузка изображений ({len(image_queue)} шт)...")
+        image_results = await process_images_batch(image_queue)
+
+        # Заменяем image_url на имя файла
+        for item in all_data:
+            key = f"{item['product_name']}_{item['image_url']}"
+            item['image'] = image_results.get(key, "Ошибка")
+            del item['image_url'] # Удаляем временный URL
+
     if all_data:
         keys = all_data[0].keys()
         file_exists = os.path.exists(CSV_FILE)
@@ -339,27 +429,64 @@ async def parse_flow(page, start_date, end_date):
 
 async def main():
     if len(sys.argv) < 2:
-        print("Использование:\n python script.py login\n python script.py parse [start_date] [end_date]\n python script.py process")
+        print("Использование:\n"
+              " python script.py login\n"
+              " python script.py parse [start_date] [end_date]\n"
+              " python script.py process\n"
+              " python script.py run_all [start_date] [end_date]")
         return
 
     mode = sys.argv[1]
 
+    # --- РЕЖИМ ПОЛНОГО ЦИКЛА ---
+    if mode == "run_all":
+        arg_start = sys.argv[2] if len(sys.argv) >= 3 else None
+        arg_end = sys.argv[3] if len(sys.argv) >= 4 else None
+
+        # 1. Рассчитываем даты
+        start_date, end_date = calculate_dates(arg_start, arg_end)
+        print(f"Авто-запуск: период {start_date} -> {end_date}")
+
+        config = load_config()
+        async with async_playwright() as p:
+            if not os.path.exists(STATE_FILE):
+                print("Ошибка: Нет файла сессии! Сначала запустите 'python script.py login'")
+                return
+
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(storage_state=STATE_FILE)
+            page = await context.new_page()
+            await page.goto(config['url'])
+
+            if await check_auth(page):
+                # 2. Запускаем парсинг
+                await parse_flow(page, start_date, end_date)
+            else:
+                print("Сессия истекла. Запустите login.")
+
+            await browser.close()
+
+        # 3. Сразу запускаем обработку данных
+        process_data()
+        print("Полный цикл завершен.")
+        return
+
+    # --- ОСТАЛЬНЫЕ РЕЖИМЫ (Оставляем как были) ---
     if mode == "process":
         process_data()
         return
 
     if mode == "parse":
-        if len(sys.argv) >= 3: start_date = sys.argv[2]
-        else: start_date = (datetime.now() - timedelta(days=30)).strftime('%Y-%m-%d')
-        if len(sys.argv) >= 4: end_date = sys.argv[3]
-        else: end_date = datetime.now().strftime('%Y-%m-%d')
+        arg_start = sys.argv[2] if len(sys.argv) >= 3 else None
+        arg_end = sys.argv[3] if len(sys.argv) >= 4 else None
+        start_date, end_date = calculate_dates(arg_start, arg_end)
+        print(f"Выбранный период: {start_date} -> {end_date}")
 
     config = load_config()
     async with async_playwright() as p:
-        # Если режим login — открываем браузер (чтобы ввести SMS),
-        # если parse — запускаем в фоне (headless=True)
-        is_headless = True if mode == "parse" else False
+        is_headless = True if mode != "login" else False
         browser = await p.chromium.launch(headless=is_headless)
+
         if mode == "login":
             context = await browser.new_context()
             page = await context.new_page()
